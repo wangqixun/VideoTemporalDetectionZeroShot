@@ -1,0 +1,34 @@
+
+
+
+
+model 的 train、test 模式区别，通过 model(return_loss=True/Flase, **data) 控制
+model(return_loss=False, **data) test  模式
+model(return_loss=True, **data)  train 模式
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
