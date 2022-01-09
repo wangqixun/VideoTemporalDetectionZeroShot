@@ -156,7 +156,8 @@ def main():
         cfg.model,
         train_cfg=cfg.get('train_cfg'),
         test_cfg=cfg.get('test_cfg'))
-    print(model)
+    # print(model)
+    # print(args.validate)
 
     if len(cfg.module_hooks) > 0:
         register_module_hooks(model, cfg.module_hooks)

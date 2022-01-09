@@ -359,7 +359,10 @@ class BaseRecognizerZeroShot(nn.Module, metaclass=ABCMeta):
                  use_vision_feature=False,
                  use_nlp_feature=False,
                  temporal_dim=100,
-                 
+                 soft_nms_alpha=0.4,
+                 soft_nms_low_threshold=0.5,
+                 soft_nms_high_threshold=0.9,
+                 post_process_top_k=100,
         ):
         super().__init__()
         # record the source of the backbone
@@ -367,7 +370,14 @@ class BaseRecognizerZeroShot(nn.Module, metaclass=ABCMeta):
         self.use_vision_feature = use_vision_feature
         self.use_nlp_feature = use_nlp_feature
         self.temporal_dim = temporal_dim
+        self.temporal_gap = 1/(self.temporal_dim-1)
         self.meshgrid = torch.meshgrid(torch.arange(temporal_dim),torch.arange(temporal_dim))
+        self.soft_nms_alpha = soft_nms_alpha
+        self.soft_nms_low_threshold = soft_nms_low_threshold
+        self.soft_nms_high_threshold = soft_nms_high_threshold
+        self.post_process_top_k = post_process_top_k
+        self.label_text = open('/new_share/wangqixun/workspace/githup_project/Video-Swin-Transformer/data/ActivityNet/anet_activity_indexes_val.txt').readlines()
+        self.label_text = [t.strip() for t in self.label_text]
 
 
         if backbone['type'].startswith('mmcls.'):
@@ -414,8 +424,13 @@ class BaseRecognizerZeroShot(nn.Module, metaclass=ABCMeta):
 
         self.zero_shot_layers = zero_shot_layers
         if self.zero_shot_layers is not None:
-            self.convert_feature = nn.Sequential(
-                nn.Linear(zero_shot_layers['in_channel'], zero_shot_layers['out_channel']),
+            self.convert_vision_feature = nn.Sequential(
+                nn.Linear(zero_shot_layers['vision_in_channel'], zero_shot_layers['out_channel']),
+                nn.LayerNorm(zero_shot_layers['out_channel']),
+                # nn.GELU(),
+            )
+            self.convert_language_feature = nn.Sequential(
+                nn.Linear(zero_shot_layers['language_in_channel'], zero_shot_layers['out_channel']),
                 nn.LayerNorm(zero_shot_layers['out_channel']),
                 # nn.GELU(),
             )

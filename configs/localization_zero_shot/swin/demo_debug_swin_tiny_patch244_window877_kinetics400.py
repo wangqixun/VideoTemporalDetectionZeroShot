@@ -12,7 +12,7 @@ model = dict(
     temporal_dim=temporal_dim,
     backbone=dict(
         type='SwinTransformer3D',
-        pretrained=None,
+        pretrained='/new_share/wangqixun/workspace/githup_project/Video-Swin-Transformer/train_wqx/swin_tiny_patch4_window7_224.pth',
         patch_size=(2,4,4),   # 2-时间 4,4-空间
         embed_dim=96,
         depths=[2, 2, 6, 2],
@@ -29,16 +29,23 @@ model = dict(
 
     nlp_backbone=dict(
         type='NLPModel',
-        pretrained_nlp='/new_share/wangqixun/workspace/githup_project/model_super_strong/transformers/hfl/chinese-roberta-wwm-ext'),
+        pretrained_nlp='/new_share/wangqixun/workspace/githup_project/model_super_strong/transformers/roberta-base',
+        freeze=True),
     use_nlp_feature=False,
 
     zero_shot_layers=dict(
-        in_channel=400,
+        vision_in_channel=400,
+        language_in_channel=768,
         out_channel=768),
 
     decoder_backbone = dict(
-        type='VisionLanguageDecoder',
-        num_transformer_decoder_layers=6,
+        # type='VisionLanguageDecoder',
+        # type='VisionEncoder',
+        # num_transformer_decoder_layers=12,
+        type='TransformerEncoder',
+        pretrained_transformers='/new_share/wangqixun/workspace/githup_project/model_super_strong/transformers/roberta-base', 
+        freeze=False, 
+        layers=6,
         ),
     
     cls_head=dict(
@@ -46,10 +53,17 @@ model = dict(
         nb_in_feature_channel=768,
         use_bias=True,
         RoPE=True,
-        loss_cfg=dict(type='multilabel_sjl'), 
+        # loss_cfg=dict(type='multilabel_sjl'), 
+        loss_cfg=dict(type='bmn_mse'), 
         ),
     
-    test_cfg = dict(average_clips='prob', max_testing_views=4))
+    # test_cfg = dict(average_clips='prob', max_testing_views=4),
+
+    soft_nms_alpha=0.4,
+    soft_nms_low_threshold=0.5,
+    soft_nms_high_threshold=0.9,
+    post_process_top_k=100,
+)
 
 # model=dict(backbone=dict(patch_size=(2,4,4), drop_path_rate=0.1), test_cfg=dict(max_testing_views=4))
 # model=dict(
@@ -63,12 +77,12 @@ model = dict(
 
 
 # dataset settings
-dataset_type = 'ActivityNetDataset'
+dataset_type = 'ActivityNetZeroShotDataset'
 data_root = 'data/ActivityNet/activitynet_feature_cuhk/csv_mean_100/'
 data_root_val = 'data/ActivityNet/activitynet_feature_cuhk/csv_mean_100/'
 ann_file_train = 'data/ActivityNet/anet_anno_train.json'
-ann_file_val = 'data/ActivityNet/anet_anno_val.json'
-ann_file_test = 'data/ActivityNet/anet_anno_val.json'
+ann_file_val = 'data/ActivityNet/anet_anno_val.json'  # anet_anno_val
+ann_file_test = 'data/ActivityNet/anet_anno_train.json'  # anet_anno_val
 
 
 train_pipeline = [
@@ -82,11 +96,11 @@ train_pipeline = [
     dict(type='ToTensor', keys=['raw_feature', 'label']),
     # dict(
     #     type='ToDataContainer',
-    #     fields=[dict(key='gt_bbox', stack=False, cpu_only=True)])
+    #     fields=[dict(key='label', stack=False, cpu_only=True)])
 ]
 val_pipeline = [
     dict(type='LoadLocalizationFeatureZeroShot'),
-    dict(type='GenerateLocalizationLabelsZeroShot'),
+    dict(type='GenerateLocalizationLabelsZeroShot', temporal_dim=temporal_dim),
     dict(
         type='Collect',
         keys=['raw_feature', 'gt_bbox'],
@@ -107,14 +121,14 @@ test_pipeline = [
         keys=['raw_feature'],
         meta_name='video_meta',
         meta_keys=[
-            'video_name', 'duration_second', 'duration_frame', 'annotations',
+            'video_name', 'duration_second', 'duration_frame', 'annotations', 
             'feature_frame'
         ]),
     dict(type='ToTensor', keys=['raw_feature']),
 ]
 
 data = dict(
-    videos_per_gpu=16,
+    videos_per_gpu=8,
     workers_per_gpu=8,
     train_dataloader=dict(drop_last=True),
     val_dataloader=dict(videos_per_gpu=1),
@@ -136,14 +150,16 @@ data = dict(
         data_prefix=data_root))
 evaluation = dict(interval=1, metrics=['AR@AN'])
 
-optimizer = dict(type='Adam', lr=0.001, weight_decay=0.0001)  # this lr is used for 2 gpus
+optimizer = dict(type='Adam', lr=0.00001, weight_decay=0.000001)  # this lr is used for 2 gpus
+# optimizer_config = dict(grad_clip=dict(max_norm=40, norm_type=2))
 optimizer_config = dict(grad_clip=None)
 
-lr_config = dict(policy='step', step=60)
-total_epochs = 100
+lr_config = dict(policy='step', step=64, warmup='linear', warmup_by_epoch=True, warmup_iters=1, )
 
-checkpoint_config = dict(interval=10)
-work_dir = './work_dirs/v0'
+total_epochs = 80
+
+checkpoint_config = dict(interval=2)
+work_dir = './work_dirs/zeroshot_v1_6'
 
 fp16 = None
 # optimizer_config = dict(
@@ -155,6 +171,7 @@ fp16 = None
 #     use_fp16=True,
 # )
 
+# resume_from='/new_share/wangqixun/workspace/githup_project/Video-Swin-Transformer/work_dirs/zeroshot_v0_6'
 find_unused_parameters = True
 
 

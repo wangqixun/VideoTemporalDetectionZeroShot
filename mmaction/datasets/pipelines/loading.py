@@ -1739,7 +1739,26 @@ class GenerateLocalizationLabelsZeroShot:
 
     def __init__(self, temporal_dim=100):
         self.temporal_dim = temporal_dim
-        self.temporal_gap = 1/temporal_dim
+        self.temporal_gap = 1/(temporal_dim-1)
+        self.label_text = open('/new_share/wangqixun/workspace/githup_project/Video-Swin-Transformer/data/ActivityNet/anet_activity_indexes_val.txt').readlines()
+        self.label_text = [t.strip() for t in self.label_text]
+
+    def ij2se(self, i, j):
+        s = max(0, (-0.5+i)*self.temporal_gap) 
+        e = min(1, (-0.5+j+1)*self.temporal_gap) 
+        return s, e 
+
+    def get_iou(self, d1, d2):
+        #x.shape = []
+        d1 = d1[:, None]
+        d2 = d2[None]
+        s1 = d1[..., 1] - d1[..., 0]
+        s2 = d2[..., 1] - d2[..., 0]
+        intersect_mins = np.maximum(d1[..., 0], d2[..., 0])
+        intersect_maxes = np.minimum(d1[..., 1], d2[..., 1])
+        intersect_area = np.maximum(0., intersect_maxes-intersect_mins)
+        iou = intersect_area / (s1 + s2 - intersect_area + 1e-10)
+        return np.maximum(0, iou)
 
 
     def __call__(self, results):
@@ -1771,21 +1790,138 @@ class GenerateLocalizationLabelsZeroShot:
         # gt_text = gt_text[mask_need]
         # gt_bbox = gt_bbox[mask_need]
 
-        random_text = np.random.choice(np.unique(gt_text))
-        mask = gt_text == random_text
-        gt_bbox = gt_bbox[mask]
-        gt_text = gt_text[mask]
+        # 存在正样本
+        if np.random.rand() < 1.0:
 
-        label = np.zeros([self.temporal_dim, self.temporal_dim])
-        for start_time, end_time in gt_bbox:
-            start_time_position = int(round(start_time * (self.temporal_dim-1)))
-            end_time_position = int(round(end_time * (self.temporal_dim-1)))
-            if end_time_position < start_time_position:
-                print(f'位置有问题！！！{results} {start_time_position} {end_time_position}')
-            label[start_time_position, end_time_position] = 1.
-        results['label'] = label
+            # random_text = np.random.choice(np.unique(gt_text))
+            # mask = gt_text == random_text
+            # gt_bbox = gt_bbox[mask]
+            # gt_text = gt_text[mask]
 
-        text = gt_text[0]
-        results['text'] = text
+            # label = np.zeros([self.temporal_dim, self.temporal_dim])
+            # for start_time, end_time in gt_bbox:
+            #     start_time_position = int(round(start_time * (self.temporal_dim-1)))
+            #     end_time_position = int(round(end_time * (self.temporal_dim-1)))
+            #     if end_time_position < start_time_position:
+            #         print(f'位置有问题！！！{results} {start_time_position} {end_time_position}')
+            #     label[start_time_position, end_time_position] = 1.
+            # results['label'] = label
+
+            i = np.arange(self.temporal_dim)
+            j = np.arange(self.temporal_dim)
+            j, i = np.meshgrid(i, j)  # T*T
+            meshgrid = np.stack([i,j], axis=-1) # T*T*2
+            meshgrid = meshgrid.reshape([-1, 2])
+            meshgrid_s = np.maximum(0, (-0.5+meshgrid[:, 0])*self.temporal_gap) 
+            meshgrid_e = np.minimum(1, (-0.5+meshgrid[:, 1]+1)*self.temporal_gap) 
+            meshgrid_bbox = np.stack([meshgrid_s, meshgrid_e], axis=-1)
+            meshgrid_iou = self.get_iou(meshgrid_bbox, gt_bbox)
+            meshgrid_iou = np.max(meshgrid_iou, axis=-1)
+            meshgrid_iou = meshgrid_iou.reshape([self.temporal_dim, self.temporal_dim])
+            label = meshgrid_iou
+            results['label'] = label
+
+            text = gt_text[0]
+            # text = 'Amazing'
+            results['text'] = text
+            return results
+
+        else:
+            text = np.random.choice(self.label_text)
+            while text in gt_text:
+                text = np.random.choice(self.label_text)
+            label = np.zeros([self.temporal_dim, self.temporal_dim])
+            results['label'] = label
+            results['text'] = text
+            return results
+            
+
+@PIPELINES.register_module()
+class FasterBMNLoadLocalizationFeature:
+    """Load Video features for localizer with given video_name list.
+
+    Required keys are "video_name" and "data_prefix", added or modified keys
+    are "raw_feature".
+
+    Args:
+        raw_feature_ext (str): Raw feature file extension.  Default: '.csv'.
+    """
+
+    def __init__(self, raw_feature_ext='.csv'):
+        valid_raw_feature_ext = ('.csv', )
+        if raw_feature_ext not in valid_raw_feature_ext:
+            raise NotImplementedError
+        self.raw_feature_ext = raw_feature_ext
+
+    def __call__(self, results):
+        """Perform the LoadLocalizationFeature loading.
+
+        Args:
+            results (dict): The resulting dict to be modified and passed
+                to the next transform in pipeline.
+        """
+        video_name = results['video_name']
+        data_prefix = results['data_prefix']
+
+        data_path = osp.join(data_prefix, video_name + self.raw_feature_ext)
+        raw_feature = np.loadtxt(
+            data_path, dtype=np.float32, delimiter=',', skiprows=1)
+
+        results['raw_feature'] = np.transpose(raw_feature, (1, 0))
+
         return results
+
+    def __repr__(self):
+        repr_str = (f'{self.__class__.__name__}('
+                    f'raw_feature_ext={self.raw_feature_ext})')
+        return repr_str
+
+
+@PIPELINES.register_module()
+class FasterBMNGenerateLocalizationLabels:
+    """Load video label for localizer with given video_name list.
+
+    Required keys are "duration_frame", "duration_second", "feature_frame",
+    "annotations", added or modified keys are "gt_bbox".
+    """
+
+    def __call__(self, results):
+        """Perform the GenerateLocalizationLabels loading.
+
+        Args:
+            results (dict): The resulting dict to be modified and passed
+                to the next transform in pipeline.
+        """
+        video_frame = results['duration_frame']
+        video_second = results['duration_second']
+        feature_frame = results['feature_frame']
+        corrected_second = float(feature_frame) / video_frame * video_second
+        annotations = results['annotations']
+
+        gt_bbox = []
+        gt_text = []
+        for annotation in annotations:
+            current_start = max(
+                min(1, annotation['segment'][0] / corrected_second), 0)
+            current_end = max(
+                min(1, annotation['segment'][1] / corrected_second), 0)
+            gt_bbox.append([current_start, current_end])
+            gt_text.append(annotation['label'])
+        gt_bbox = np.array(gt_bbox)
+        gt_text = np.array(gt_text)
+
+        # 随机选一个text类别
+        # random_text = np.random.choice(np.unique(gt_text))
+        # mask = gt_text == random_text
+        # gt_bbox = gt_bbox[mask]
+        # gt_text = gt_text[mask]
+        
+
+        # text = gt_text[0]
+        text = 'Amazing'
+
+        results['text'] = text
+        results['gt_bbox'] = gt_bbox
+        return results
+
 

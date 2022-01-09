@@ -306,6 +306,7 @@ def average_recall_at_avg_proposals(ground_truth,
     for video_id in ground_truth:
         # Get proposals for this video.
         proposals_video_id = proposals[video_id]
+        # print('proposals_video_id', proposals_video_id)
         this_video_proposals = proposals_video_id[:, :2]
         # Sort proposals by score.
         sort_idx = proposals_video_id[:, 2].argsort()[::-1]

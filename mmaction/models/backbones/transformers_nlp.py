@@ -35,11 +35,15 @@ from rich import print
 
 @BACKBONES.register_module()
 class NLPModel(nn.Module):
-    def __init__(self, pretrained_nlp, max_length=64):
+    def __init__(self, pretrained_nlp, max_length=64, freeze=False):
         super().__init__()
         self.nlp_model = AutoModel.from_pretrained(pretrained_nlp)
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_nlp)
         self.max_length = max_length
+        if freeze:
+            self.nlp_model.eval()
+            for p in self.nlp_model.parameters():
+                p.requires_grad = False   #预训练模型加载进来后全部设置为不更新参数，然后再后面加层
 
 
     def mean_pooling(self, model_output, attention_mask):
@@ -55,11 +59,11 @@ class NLPModel(nn.Module):
         for key in encoded_input.keys():
             encoded_input[key] = encoded_input[key].to(device)
         model_output = self.nlp_model(**encoded_input)
-        # x = self.mean_pooling(model_output, encoded_input['attention_mask'])
+        output_global_feature = self.mean_pooling(model_output, encoded_input['attention_mask'])
         
         output_feature = model_output[0]
         input_mask = encoded_input['attention_mask']
-        return output_feature, input_mask
+        return output_feature, input_mask, output_global_feature
 
 
 
@@ -101,12 +105,12 @@ class SelfAttention(nn.Module):
     ):
         mixed_query_layer = self.query(hidden_states)
 
-        # Self attention
+        # Not Self attention
         if encoder_hidden_states is not None:
             mixed_key_layer = self.key(encoder_hidden_states)
             mixed_value_layer = self.value(encoder_hidden_states)
             attention_mask = encoder_attention_mask
-        # Not Self attention
+        # Self attention
         else:
             mixed_key_layer = self.key(hidden_states)
             mixed_value_layer = self.value(hidden_states)
@@ -316,6 +320,64 @@ class TransformerLayer(nn.Module):
         return hidden_states, attention_scores_res
 
 
+class TransformerLayerEncoder(nn.Module):
+    def __init__(self, 
+        num_attention_heads=12,
+        hidden_size=768,
+        attention_probs_dropout_prob=0.1,
+        hidden_act='gelu',
+        intermediate_size=1024,
+        hidden_dropout_prob=0.1,
+        position_embedding_type='absolute',
+        layer_norm_eps=1e-12,
+    ):
+        super().__init__()
+        self.attention_encoder = Attention(
+            num_attention_heads=num_attention_heads,
+            hidden_size=hidden_size,
+            attention_probs_dropout_prob=attention_probs_dropout_prob,
+            position_embedding_type=position_embedding_type,
+            layer_norm_eps=layer_norm_eps,
+            hidden_dropout_prob=hidden_dropout_prob,
+        )
+        self.intermediate = Intermediate(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            hidden_act=hidden_act,
+        )
+        self.output = Output(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            hidden_dropout_prob=hidden_dropout_prob,
+            layer_norm_eps=layer_norm_eps,
+        )
+
+    def forward(
+            self,
+            hidden_states,                     # q
+            attention_mask=None,               # 做 self attention 时候需要的mask。做翻译的decoder的时候需要。视频零样本时序预测不需要
+            head_mask=None,                    # head上加mask。基本不需要
+            encoder_hidden_states=None,        # kv
+            encoder_attention_mask=None,       # 做 cross attention 时候需要的mask。用来消除文本长度不齐进行padding带来的影响
+            output_attentions=False,           # 输出attention结果。不要输出
+            attention_scores_res_self=False,   # real former 中上一层的 self attention
+            attention_scores_res_encoder=False,# real former 中上一层的 cross attention
+    ):
+        hidden_states = self.attention_encoder(
+            hidden_states,
+            attention_mask,
+            head_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            output_attentions,
+            attention_scores_res_encoder,
+        )
+        attention_output, attention_scores_res_encoder = hidden_states
+
+        hidden_states = self.intermediate(attention_output)
+        hidden_states = self.output(hidden_states, attention_output)
+        return hidden_states, attention_scores_res_self, attention_scores_res_encoder
+
 class TransformerLayerDecoder(nn.Module):
     def __init__(self, 
         num_attention_heads=12,
@@ -470,7 +532,7 @@ class VisionLanguageDecoder(nn.Module):
         
         # 做 cross attention 时候需要的mask。用来消除文本长度不齐进行padding带来的影响
         if language_attention_mask is None:
-            language_attention_mask = (1 - language_mask) * 1e10
+            language_attention_mask = (1 - language_mask) * -1e10                   #   
             language_attention_mask = language_attention_mask[:, None, None]        # [bs, N_l] -> [bs, 1, 1, N_l]
 
         hidden_states = vision_feature
@@ -481,8 +543,9 @@ class VisionLanguageDecoder(nn.Module):
             attention_scores_res_self = None
             attention_scores_res_encoder = None
 
+        # hidden_states = self.position_embedding_layer(hidden_states)
         for i, layer_module in enumerate(self.transformer):
-            hidden_states = self.position_embedding_layer(vision_feature)
+            hidden_states = self.position_embedding_layer(hidden_states)
             hidden_states = layer_module(
                 hidden_states=hidden_states,                               # q
                 attention_mask=vision_attention_mask,                      # q mask
@@ -494,6 +557,115 @@ class VisionLanguageDecoder(nn.Module):
             hidden_states, attention_scores_res_self, attention_scores_res_encoder = hidden_states
 
         return hidden_states
+
+
+@BACKBONES.register_module()
+class VisionEncoder(nn.Module):
+    def __init__(self, 
+        num_transformer_decoder_layers=4,
+        num_attention_heads=12,
+        hidden_size=768,
+        attention_probs_dropout_prob=0.1,
+        hidden_act='gelu',
+        intermediate_size=1024,
+        hidden_dropout_prob=0.1,
+        position_embedding_type='absolute',
+        layer_norm_eps=1e-12,
+        real_former=False,
+    ):
+        super().__init__()
+
+        self.transformer = nn.ModuleList([
+            TransformerLayerDecoder(
+                num_attention_heads=num_attention_heads,
+                hidden_size=hidden_size,
+                attention_probs_dropout_prob=attention_probs_dropout_prob,
+                hidden_act=hidden_act,
+                intermediate_size=intermediate_size,
+                hidden_dropout_prob=hidden_dropout_prob,
+                position_embedding_type=position_embedding_type,
+                layer_norm_eps=layer_norm_eps,
+            ) 
+            for _ in range(num_transformer_decoder_layers)
+        ])
+        self.real_former = real_former
+        self.position_embedding_layer = PositionEmbedding()
+
+
+    def forward(self, 
+        vision_feature,                # bs, N_v, 768
+        vision_attention_mask=None,
+    ):
+        # 做 self attention 时候需要的mask。做翻译的decoder的时候需要。视频零样本时序预测不需要
+        if vision_attention_mask is None:
+            vision_attention_mask = 0
+        
+        hidden_states = vision_feature
+        if self.real_former:
+            attention_scores_res_self = 0
+            attention_scores_res_encoder = 0
+        else:
+            attention_scores_res_self = None
+            attention_scores_res_encoder = None
+
+        hidden_states = self.position_embedding_layer(hidden_states)
+        for i, layer_module in enumerate(self.transformer):
+            # hidden_states = self.position_embedding_layer(hidden_states)
+            hidden_states = layer_module(
+                hidden_states=hidden_states,                               # q
+                attention_mask=vision_attention_mask,                      # q mask
+                encoder_hidden_states=None,                    # kv
+                encoder_attention_mask=None,            # kv mask
+                attention_scores_res_self=attention_scores_res_self,       # self realf ormer
+                attention_scores_res_encoder=attention_scores_res_encoder, # cross realf ormer
+            )
+            hidden_states, attention_scores_res_self, attention_scores_res_encoder = hidden_states
+
+        return hidden_states
+
+@BACKBONES.register_module()
+class TransformerEncoder(nn.Module):
+    def __init__(self, pretrained_transformers, freeze=False, layers=6, final_channel_number=768):
+        super().__init__()
+        self.model = AutoModel.from_pretrained(pretrained_transformers)
+        self.model.encoder.layer = self.model.encoder.layer[:layers]
+        self.embeddings = self.model.embeddings
+        self.model = self.model.encoder
+        self.norm = nn.LayerNorm(final_channel_number)
+        if freeze:
+            self.model.eval()
+            for p in self.model.parameters():
+                p.requires_grad = False   #预训练模型加载进来后全部设置为不更新参数，然后再后面加层
+
+    def forward(self, 
+        embedding_input, 
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        past_key_values=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=True,
+    ):
+        embedding_input_with_position = self.embeddings(inputs_embeds=embedding_input)
+        output = self.model(
+            embedding_input_with_position,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        embedding_output = output[0]
+        embedding_output = self.norm(embedding_output)
+        return embedding_output
+
 
 
 

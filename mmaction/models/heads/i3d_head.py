@@ -1,4 +1,5 @@
 import torch.nn as nn
+import torch.nn.functional as F
 import torch
 from mmcv.cnn import normal_init
 from abc import ABCMeta
@@ -90,10 +91,12 @@ class GlobalPointerHeadZeroShot(nn.Module, metaclass=ABCMeta):
         self.nb_in_feature_channel = nb_in_feature_channel
         self.q_layer = nn.Linear(nb_in_feature_channel, nb_in_feature_channel, use_bias)
         self.k_layer = nn.Linear(nb_in_feature_channel, nb_in_feature_channel, use_bias)
+        self.q_layer_cls = nn.Linear(nb_in_feature_channel, nb_in_feature_channel, use_bias)
+        self.k_layer_cls = nn.Linear(nb_in_feature_channel, nb_in_feature_channel, use_bias)
         self.RoPE = RoPE
         self.loss_cfg = loss_cfg
         self.act_sigmoid = nn.Sigmoid()
-        
+        self.bce_loss = nn.BCELoss(reduction='none')
 
     def init_weights(self):
         """Initiate the parameters from scratch."""
@@ -116,32 +119,39 @@ class GlobalPointerHeadZeroShot(nn.Module, metaclass=ABCMeta):
 
         return pos_embeddings_batch.to(device)  # [1, N, C]
 
-
-    def forward(self, inputs):
-        x = inputs['feature']  # [bs, N, N]
+    def global_pointer(self, inputs, q_layer, k_layer):
+        x = inputs['feature']  # [bs, N, 768]
         N = x.shape[1]
 
-        x_q = self.q_layer(x)
-        x_k = self.k_layer(x)
+        x_q = q_layer(x)
+        x_k = k_layer(x)
         if self.RoPE:
             pos_emb = self.sinusoidal_position_embedding(x)
             cos_pos = pos_emb[..., 1::2].repeat_interleave(2, dim=-1)
             sin_pos = pos_emb[..., ::2].repeat_interleave(2, dim=-1)
+
             x_q2 = torch.stack([-x_q[..., 1::2], x_q[...,::2]], -1)
             x_q2 = x_q2.reshape(x.shape)
             x_q = x_q * cos_pos + x_q2 * sin_pos
+
             x_k2 = torch.stack([-x_k[..., 1::2], x_k[...,::2]], -1)
             x_k2 = x_k2.reshape(x.shape)
             x_k = x_k * cos_pos + x_k2 * sin_pos
 
         # qk计算内积
-        logits = x_q @ x_k.permute(0, 2, 1)
+        # logits = x_q @ x_k.permute(0, 2, 1)
+        logits = torch.matmul(x_q, x_k.transpose(-1, -2))
         mask = torch.tril(torch.ones(N, N), diagonal=-1).to(x.device)  # 下三角矩阵
         logits = logits - mask * 1e10
-        return logits / self.nb_in_feature_channel**0.5
+        return logits / (self.nb_in_feature_channel**0.5)
 
+    def forward(self, inputs):
+        global_pointer_output_1 = self.global_pointer(inputs, self.q_layer, self.k_layer)
+        global_pointer_output_2 = self.global_pointer(inputs, self.q_layer_cls, self.k_layer_cls)
+        output = dict(global_pointer=global_pointer_output_1, global_pointer_cls=global_pointer_output_2)
+        return output
 
-    # keras 版本，from 苏神
+    # from 苏神
     def multilabel_categorical_crossentropy(self, y_true, y_pred):
         """多标签分类的交叉熵
         说明：y_true和y_pred的shape一致，y_true的元素非0即1，
@@ -164,23 +174,137 @@ class GlobalPointerHeadZeroShot(nn.Module, metaclass=ABCMeta):
         return loss
 
 
-    # keras 版本，from 苏神
+    # from 苏神
     def global_pointer_crossentropy(self, y_true, y_pred):
         """给GlobalPointer设计的交叉熵
         """
+        y_pred = y_pred['global_pointer_cls']
+        gt_iou_map = y_true
+
+        y_true = (gt_iou_map > 0.9).float()
+
         bs, N, N = y_pred.shape
-        y_true = y_true.reshape([bs*N, N])
-        y_pred = y_pred.reshape([bs*N, N])
+        y_true = y_true.reshape([bs, -1])
+        y_pred = y_pred.reshape([bs, -1])
         return torch.mean(self.multilabel_categorical_crossentropy(y_true, y_pred))
 
 
-    def loss(self, global_pointer, gt_labels, **kwargs):
+    def bmn_mse(self, y_true, y_pred, high_temporal_iou_threshold=0.7, low_temporal_iou_threshold=0.3):
+        y_pred = y_pred['global_pointer']
+
+        y_pred_sigmoid = torch.sigmoid(y_pred)
+        bs, N, N = y_pred.shape
+        mask = torch.tril(torch.ones(N, N), diagonal=-1).to(y_pred.device)  # 下三角矩阵
+        mask = (1-mask).float()
+
+        gt_iou_map = y_true.float()
+        pred_score = y_pred_sigmoid.float()
+
+        u_hmask = (gt_iou_map > high_temporal_iou_threshold).float()
+        u_mmask = ((gt_iou_map <= high_temporal_iou_threshold) & (gt_iou_map > low_temporal_iou_threshold)).float()
+        u_lmask = ((gt_iou_map <= low_temporal_iou_threshold) & (gt_iou_map > 0.)).float()
+        u_lmask = u_lmask * mask
+
+        num_h = torch.sum(u_hmask)
+        num_m = torch.sum(u_mmask)
+        num_l = torch.sum(u_lmask)
+
+        r_m = num_h / (num_m+1e-10)
+        u_smmask = torch.rand_like(gt_iou_map)
+        u_smmask = u_mmask * u_smmask
+        u_smmask = (u_smmask > (1. - r_m)).float()
+
+        r_l = num_h / (num_l+1e-10)
+        u_slmask = torch.rand_like(gt_iou_map)
+        u_slmask = u_lmask * u_slmask
+        u_slmask = (u_slmask > (1. - r_l)).float()
+
+        weights = u_hmask + u_smmask + u_slmask
+
+        loss = F.mse_loss(pred_score * weights, gt_iou_map * weights)
+        loss = torch.sum(loss * torch.ones_like(weights)) / torch.sum(weights)
+        return loss*10
+
+    def faster_rcnn_cls_loss(self, y_true, y_pred, high_temporal_iou_threshold=0.7, low_temporal_iou_threshold=0.3):
+        y_pred = y_pred['global_pointer_cls']
+
+        y_pred_sigmoid = torch.sigmoid(y_pred)
+        bs, N, N = y_pred.shape
+        mask = torch.tril(torch.ones(N, N), diagonal=-1).to(y_pred.device)  # 下三角矩阵
+        mask = (1-mask).float()
+
+        gt_iou_map = y_true.float()
+        pred_score = y_pred_sigmoid.float()
+        h_label = torch.ones_like(gt_iou_map)
+        s_label = torch.zeros_like(gt_iou_map)
+
+        u_hmask = (gt_iou_map > high_temporal_iou_threshold).float()
+        u_lmask = ((gt_iou_map <= low_temporal_iou_threshold) & (gt_iou_map > 0.)).float()
+        u_lmask = u_lmask * mask
+
+        num_h = torch.sum(u_hmask)
+        num_l = torch.sum(u_lmask)
+
+        r_l = num_h / (num_l+1e-10)
+        u_slmask = torch.rand_like(gt_iou_map)
+        u_slmask = u_lmask * u_slmask
+        u_slmask = (u_slmask > (1. - r_l)).float()
+
+        h_cls_loss = self.bce_loss(pred_score*u_hmask, h_label*u_hmask)
+        s_cls_loss = self.bce_loss(pred_score*u_slmask, s_label*u_slmask)
+        h_cls_loss = torch.sum(h_cls_loss*u_hmask)/(torch.sum(u_hmask)+1e-10)
+        s_cls_loss = torch.sum(s_cls_loss*u_slmask)/(torch.sum(u_slmask)+1e-10)
+        loss = h_cls_loss + s_cls_loss
+        return loss
+
+    def bmn_cls_loss(self, y_true, y_pred, threshold=0.9, ratio_range=(1.05, 21), eps=1e-10):
+        y_pred = y_pred['global_pointer_cls']
+
+        y_pred_sigmoid = torch.sigmoid(y_pred)
+        bs, N, N = y_pred.shape
+        mask = torch.tril(torch.ones(N, N), diagonal=-1).to(y_pred.device)  # 下三角矩阵
+        mask = (1-mask).float()
+
+        gt_iou_map = y_true.float()
+        pred_score = y_pred_sigmoid.float()
+
+        pmask = (gt_iou_map > threshold).float()
+        nmask = (gt_iou_map <= threshold).float()
+        nmask = nmask * mask
+
+        num_positive = max(torch.sum(pmask), 1)
+        num_entries = num_positive + torch.sum(nmask)
+        ratio = num_entries / num_positive
+        ratio = torch.clamp(ratio, ratio_range[0], ratio_range[1])
+
+        coef_0 = 0.5 * ratio / (ratio - 1)
+        coef_1 = 0.5 * ratio
+
+        loss_pos = coef_1 * torch.log(pred_score + eps) * pmask
+        loss_neg = coef_0 * torch.log(1.0 - pred_score + eps) * nmask
+        loss = -1 * torch.sum(loss_pos + loss_neg) / num_entries
+        return loss
+
+    # def bmn_pem_cls_loss(self, y_true, y_pred, threshold=0.9, )
+
+    def loss(self, global_pointer_output, gt_labels, **kwargs):
         # global_pointer.shape = gt_labels.shape = [bs, N, N]
 
         if self.loss_cfg['type'] == 'multilabel_sjl':
-            loss_cls = self.global_pointer_crossentropy(gt_labels, global_pointer)
+            loss_cls = self.global_pointer_crossentropy(gt_labels, global_pointer_output)
+        if self.loss_cfg['type'] == 'bmn_mse':
+            loss_reg = self.bmn_mse(gt_labels, global_pointer_output)
+            # loss_cls = self.faster_rcnn_cls_loss(gt_labels, global_pointer_output)
+            loss_cls = self.bmn_cls_loss(gt_labels, global_pointer_output)
+            losses = dict(loss_cls=loss_cls, loss_reg=loss_reg)
+            return losses
+        if self.loss_cfg['type'] == 'multilabel_sjl_bmn_mse':
+            loss_reg = self.bmn_mse(gt_labels, global_pointer_output)
+            loss_cls = self.global_pointer_crossentropy(gt_labels, global_pointer_output)
+            losses = dict(loss_cls=loss_cls, loss_reg=loss_reg)
+            return losses
         else:
-            loss_cls = torch.mean(global_pointer - gt_labels)
+            loss_cls = torch.mean(global_pointer_output - gt_labels)
 
         losses = dict(loss_cls=loss_cls)
         return losses

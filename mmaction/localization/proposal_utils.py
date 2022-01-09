@@ -92,3 +92,5 @@ def soft_nms(proposals, alpha, low_threshold, high_threshold, top_k):
     rscore = np.array(rscore).reshape(-1, 1)
     new_proposals = np.concatenate((rstart, rend, rscore), axis=1)
     return new_proposals
+
+
