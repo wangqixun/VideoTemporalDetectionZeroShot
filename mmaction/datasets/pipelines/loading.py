@@ -1884,6 +1884,8 @@ class FasterBMNGenerateLocalizationLabels:
     Required keys are "duration_frame", "duration_second", "feature_frame",
     "annotations", added or modified keys are "gt_bbox".
     """
+    def __init__(self, mode='train'):
+        self.mode = mode
 
     def __call__(self, results):
         """Perform the GenerateLocalizationLabels loading.
@@ -1910,15 +1912,23 @@ class FasterBMNGenerateLocalizationLabels:
         gt_bbox = np.array(gt_bbox)
         gt_text = np.array(gt_text)
 
-        # 随机选一个text类别
-        # random_text = np.random.choice(np.unique(gt_text))
-        # mask = gt_text == random_text
-        # gt_bbox = gt_bbox[mask]
-        # gt_text = gt_text[mask]
-        
+        if self.mode == 'train':
+            # 随机选一个text类别
+            # random_text = np.random.choice(np.unique(gt_text))
+            # mask = gt_text == random_text
+            # gt_bbox = gt_bbox[mask]
+            # gt_text = gt_text[mask]
+            # text = gt_text[0]
+            text = 'Amazing'
+        elif self.mode == 'val':
+            # gt_text = gt_text
+            # text = gt_text.astype(str).tolist()
+            text = ['Amazing']
 
-        # text = gt_text[0]
-        text = 'Amazing'
+
+
+        
+        # text = '王奇勋'
 
         results['text'] = text
         results['gt_bbox'] = gt_bbox

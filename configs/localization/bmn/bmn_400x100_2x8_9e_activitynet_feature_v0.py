@@ -23,6 +23,7 @@ model = dict(
         freeze=False, 
         layers=6, 
         final_channel_number=768,
+        replace_dict=[['roberta.', '']],
     ),
 )
 
@@ -37,8 +38,7 @@ ann_file_test = 'data/ActivityNet/anet_anno_val.json'
 
 test_pipeline = [
     dict(type='FasterBMNLoadLocalizationFeature'),
-    dict(type='FasterBMNGenerateLocalizationLabels'),
-
+    dict(type='FasterBMNGenerateLocalizationLabels', mode='val'),
     dict(
         type='Collect',
         keys=['raw_feature'],
@@ -106,8 +106,8 @@ optimizer = dict(
     type='AdamW', lr=0.00001, weight_decay=0.000001)  # this lr is used for 2 gpus
 optimizer_config = dict(grad_clip=None)
 # learning policy
-lr_config = dict(policy='step', step=14)
-total_epochs = 18
+lr_config = dict(policy='step', step=63)
+total_epochs = 81
 
 # runtime settings
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])

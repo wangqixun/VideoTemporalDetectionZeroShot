@@ -13,7 +13,9 @@ from rich import print
 import transformers
 from transformers import AutoModel
 from transformers import AutoTokenizer, AutoConfig
-
+from collections import OrderedDict
+import os
+import copy
 
 @LOCALIZERS.register_module()
 class BMN(BaseLocalizer):
@@ -427,6 +429,7 @@ class TransformerEncoder(nn.Module):
         super().__init__()
         self.model = AutoModel.from_pretrained(pretrained_transformers)
         self.model.encoder.layer = self.model.encoder.layer[:layers]
+        self.model.embeddings.word_embeddings = None
         self.embeddings = self.model.embeddings
         self.model = self.model.encoder
         self.norm = nn.LayerNorm(final_channel_number)
@@ -466,21 +469,42 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, pretrained_transformers, freeze=False, layers=6, final_channel_number=768):
+    def __init__(self, pretrained_transformers, freeze=False, layers=6, final_channel_number=768, replace_dict=[['roberta.', '']]):
         super().__init__()
         self.config = AutoConfig.from_pretrained(pretrained_transformers)
         self.config.is_decoder=True
         self.config.add_cross_attention=True
         self.model = AutoModel.from_config(self.config)
 
-        self.model.encoder.layer = self.model.encoder.layer[:layers]
-        self.embeddings = self.model.embeddings
-        self.model = self.model.encoder
-        self.norm = nn.LayerNorm(final_channel_number)
+        self.init_weight(pretrained_transformers, replace_dict)
         if freeze:
             self.model.eval()
             for p in self.model.parameters():
                 p.requires_grad = False   #预训练模型加载进来后全部设置为不更新参数，然后再后面加层
+
+        self.model.encoder.layer = self.model.encoder.layer[:layers]
+        self.model.embeddings.word_embeddings = None
+        self.embeddings_q = self.model.embeddings
+        self.embeddings_kv = copy.deepcopy(self.embeddings_q)
+        self.model = self.model.encoder
+        self.norm = nn.LayerNorm(final_channel_number)
+
+
+    def init_weight(self, pretrained_transformers, replace_dict=[]):
+        state_dict = torch.load(os.path.join(pretrained_transformers, 'pytorch_model.bin'), map_location='cpu')
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items(): 
+
+            new_k = k
+            for raw_str, replace_str in replace_dict:
+                new_k = new_k.replace(raw_str, replace_str) 
+            new_state_dict[new_k] = v 
+
+            if '.attention.' in new_k: 
+                new_k = new_k.replace('.attention.', '.crossattention.') 
+                new_state_dict[new_k] = v 
+        self.model.load_state_dict(new_state_dict, strict=False)
+
 
     def forward(self, 
         embedding_input, 
@@ -493,32 +517,46 @@ class TransformerDecoder(nn.Module):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=True,
+        emb_q=False,
+        emb_kv=False,
     ):
-        embedding_input_with_position = self.embeddings(inputs_embeds=embedding_input)
+        if emb_q:
+            embedding_input_with_position = self.embeddings_q(inputs_embeds=embedding_input)
+        else:
+            embedding_input_with_position = embedding_input
+        if emb_kv:
+            encoder_hidden_states_with_position = self.embeddings_kv(inputs_embeds=encoder_hidden_states)
+        else:
+            encoder_hidden_states_with_position = encoder_hidden_states
         output = self.model(
             embedding_input_with_position,
             attention_mask=attention_mask,
             head_mask=head_mask,
-            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states=encoder_hidden_states_with_position,
             encoder_attention_mask=encoder_attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            extra_layer=self.embeddings_q,
         )
         embedding_output = output[0]
+        embedding_output = self.embeddings_q(inputs_embeds=embedding_output)
         embedding_output = self.norm(embedding_output)
         return embedding_output
 
 
 class NLPModel(nn.Module):
-    def __init__(self, pretrained_nlp, max_length=64, freeze=False):
+    def __init__(self, pretrained_nlp, layers=6, final_channel_number=768, max_length=64, freeze=False):
         super().__init__()
         self.nlp_model = AutoModel.from_pretrained(pretrained_nlp)
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_nlp)
         self.config = AutoConfig.from_pretrained(pretrained_nlp)
         self.max_length = max_length
+        self.norm = nn.LayerNorm(final_channel_number)
+        self.nlp_model.encoder.layer = self.nlp_model.encoder.layer[:layers]
+
         if freeze:
             self.nlp_model.eval()
             for p in self.nlp_model.parameters():
@@ -538,8 +576,10 @@ class NLPModel(nn.Module):
         for key in encoded_input.keys():
             encoded_input[key] = encoded_input[key].to(device)
         model_output = self.nlp_model(**encoded_input)
+
         output_global_feature = self.mean_pooling(model_output, encoded_input['attention_mask'])
-        
+        output_global_feature = self.norm(output_global_feature)
+
         output_feature = model_output[0]
         input_mask = encoded_input['attention_mask']
         return output_feature, input_mask, output_global_feature
@@ -624,11 +664,21 @@ class TBMN(BaseLocalizer):
             freeze=cross_feature_decoder['freeze'], 
             layers=cross_feature_decoder['layers'], 
             final_channel_number=cross_feature_decoder['final_channel_number'], 
+            replace_dict=cross_feature_decoder['replace_dict'],
             )
+        # self.cross_feature_encoder = TransformerEncoder(
+        #     pretrained_transformers=cross_feature_decoder['pretrained_cross_feature_decoder'], 
+        #     freeze=cross_feature_decoder['freeze'], 
+        #     layers=cross_feature_decoder['layers'], 
+        #     final_channel_number=cross_feature_decoder['final_channel_number'], 
+        #     # replace_dict=cross_feature_decoder['replace_dict'],
+        #     )
         self.convert_output_feature_dim = nn.Sequential(
             nn.Linear(768, 400),
             nn.LayerNorm(400),
         )
+        self.x_s = nn.Sequential(nn.Conv1d(400, 400, kernel_size=3, padding=1, groups=4), nn.ReLU(inplace=True), nn.Conv1d(400, 1, kernel_size=1,), nn.Sigmoid())
+        self.x_e = nn.Sequential(nn.Conv1d(400, 400, kernel_size=3, padding=1, groups=4), nn.ReLU(inplace=True), nn.Conv1d(400, 1, kernel_size=1,), nn.Sigmoid())
 
 
         self._get_interp1d_mask()
@@ -692,8 +742,7 @@ class TBMN(BaseLocalizer):
                 kernel_size=3,
                 padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(self.hidden_dim_2d, 2, kernel_size=1), nn.Sigmoid())
-        self.anchors_tmins, self.anchors_tmaxs = self._temporal_anchors(
-            -0.5, 1.5)
+        self.anchors_tmins, self.anchors_tmaxs = self._temporal_anchors(-0.5, 1.5)
         self.match_map = self._match_map()
         self.bm_mask = self._get_bm_mask()
 
@@ -735,7 +784,7 @@ class TBMN(BaseLocalizer):
 
         return anchors_tmins, anchors_tmaxs
 
-    def _forward(self, x, video_meta):
+    def _forward(self, x, video_meta, text=None):
         """Define the computation performed at every call.
 
         Args:
@@ -746,15 +795,43 @@ class TBMN(BaseLocalizer):
         """
         # x.shape [batch_size, self.feat_dim, self.tscale]
 
-        text = [vm['text'] for vm in video_meta]
-        text_feature, attention_mask, text_global_feature = self.language_encoder(text, x.device)
-        query_text_global_feature = torch.repeat_interleave(text_global_feature, self.tscale, 1)
+        if text is not None:
+            text = [text]
+        else:
+            text = [vm['text'] for vm in video_meta]
 
-        x = x.permute(0, 2, 1)
-        x = self.convert_input_feature_dim(x)
-        x = self.cross_feature_decoder(query_text_global_feature, encoder_hidden_states=x)
-        x = self.convert_output_feature_dim(x)
-        x = x.permute(0, 2, 1)
+        # 纯位置decoder
+        # x_tran = x.permute(0, 2, 1) #  [bs, c, t] -> [bs, t, c]
+        # x_tran = self.convert_input_feature_dim(x_tran)
+        # position_feature = torch.zeros_like(x_tran)
+        # x_tran = self.cross_feature_decoder(position_feature, encoder_hidden_states=x_tran, emb_q=False, emb_kv=True)
+        # x_tran = self.convert_output_feature_dim(x_tran)
+        # x_tran = x_tran.permute(0, 2, 1)  #  [bs, t, c] -> [bs, c, t]
+        # start = self.x_s(x_tran).squeeze(1)
+        # end = self.x_e(x_tran).squeeze(1)
+
+        # decoder 模式
+        # text_feature, attention_mask, text_global_feature = self.language_encoder(text, x.device)
+        # query_text_global_feature = torch.repeat_interleave(text_global_feature, self.tscale, 1)
+        # res_x = x
+        # x = x.permute(0, 2, 1)
+        # x = self.convert_input_feature_dim(x)
+        # x = self.cross_feature_decoder(query_text_global_feature, encoder_hidden_states=x, emb_q=False, emb_kv=True)
+        # x = self.convert_output_feature_dim(x)
+        # x = x.permute(0, 2, 1)
+
+        # encoder 模式
+        # text_feature, text_mask, _ = self.language_encoder(text, x.device)
+        # vision_feature = x.permute(0, 2, 1)
+        # vision_feature = self.convert_input_feature_dim(vision_feature)
+        # vision_mask = torch.ones_like(vision_feature)[..., 0]
+        # mix_feature = torch.cat([vision_feature, text_feature], dim=1)
+        # mix_mask = torch.cat([vision_mask, text_mask], dim=1).float()
+        # mix_mask = (1 - mix_mask[:, None, None, :]) * -10000
+        # mix_feature = self.cross_feature_encoder(mix_feature, attention_mask=mix_mask)
+        # mix_feature = self.convert_output_feature_dim(mix_feature)
+        # mix_feature = mix_feature[:, :self.tscale]
+        # x = mix_feature.permute(0, 2, 1)
 
 
         base_feature = self.x_1d_b(x)
@@ -786,59 +863,79 @@ class TBMN(BaseLocalizer):
 
     def forward_test(self, raw_feature, video_meta):
         """Define the computation performed at every call when testing."""
-        confidence_map, start, end = self._forward(raw_feature, video_meta)
-        start_scores = start[0].cpu().numpy()
-        end_scores = end[0].cpu().numpy()
-        cls_confidence = (confidence_map[0][1]).cpu().numpy()
-        reg_confidence = (confidence_map[0][0]).cpu().numpy()
+        '''
+        proposal_list list[dict]: The updated proposals, e.g.
+            [{'score': 0.9, 'segment': [0, 1]},
+             {'score': 0.8, 'segment': [0, 2]},
+            ...].
+        output = [
+            dict(
+                video_name=video_info['video_name'],
+                proposal_list=proposal_list)
+        ]
+        '''
+        # all_text = np.array([vm['text'] for vm in video_meta])
+        all_text = np.array(video_meta[0]['text'])
+        all_text = np.unique(all_text)
+        proposal_list = []
 
-        max_start = max(start_scores)
-        max_end = max(end_scores)
+        for text in all_text:
+            confidence_map, start, end = self._forward(raw_feature, video_meta, text=text)
+            start_scores = start[0].cpu().numpy()
+            end_scores = end[0].cpu().numpy()
+            cls_confidence = (confidence_map[0][1]).cpu().numpy()
+            reg_confidence = (confidence_map[0][0]).cpu().numpy()
 
-        # generate the set of start points and end points
-        start_bins = np.zeros(len(start_scores))
-        start_bins[0] = 1  # [1,0,0...,0,0]
-        end_bins = np.zeros(len(end_scores))
-        end_bins[-1] = 1  # [0,0,0...,0,1]
-        for idx in range(1, self.tscale - 1):
-            if start_scores[idx] > start_scores[
-                    idx + 1] and start_scores[idx] > start_scores[idx - 1]:
-                start_bins[idx] = 1
-            elif start_scores[idx] > (0.5 * max_start):
-                start_bins[idx] = 1
-            if end_scores[idx] > end_scores[
-                    idx + 1] and end_scores[idx] > end_scores[idx - 1]:
-                end_bins[idx] = 1
-            elif end_scores[idx] > (0.5 * max_end):
-                end_bins[idx] = 1
+            max_start = max(start_scores)
+            max_end = max(end_scores)
 
-        # iterate through all combinations of start_index and end_index
-        new_proposals = []
-        for idx in range(self.tscale):
-            for jdx in range(self.tscale):
-                start_index = jdx
-                end_index = start_index + idx + 1
-                if end_index < self.tscale and start_bins[
-                        start_index] == 1 and end_bins[end_index] == 1:
-                    tmin = start_index / self.tscale
-                    tmax = end_index / self.tscale
-                    tmin_score = start_scores[start_index]
-                    tmax_score = end_scores[end_index]
-                    cls_score = cls_confidence[idx, jdx]
-                    reg_score = reg_confidence[idx, jdx]
-                    score = tmin_score * tmax_score * cls_score * reg_score
-                    new_proposals.append([
-                        tmin, tmax, tmin_score, tmax_score, cls_score,
-                        reg_score, score
-                    ])
-        new_proposals = np.stack(new_proposals)
-        video_info = dict(video_meta[0])
-        proposal_list = post_processing(new_proposals, video_info,
-                                        self.soft_nms_alpha,
-                                        self.soft_nms_low_threshold,
-                                        self.soft_nms_high_threshold,
-                                        self.post_process_top_k,
-                                        self.feature_extraction_interval)
+            # generate the set of start points and end points
+            start_bins = np.zeros(len(start_scores))
+            start_bins[0] = 1  # [1,0,0...,0,0]
+            end_bins = np.zeros(len(end_scores))
+            end_bins[-1] = 1  # [0,0,0...,0,1]
+            for idx in range(1, self.tscale - 1):
+                if start_scores[idx] > start_scores[
+                        idx + 1] and start_scores[idx] > start_scores[idx - 1]:
+                    start_bins[idx] = 1
+                elif start_scores[idx] > (0.5 * max_start):
+                    start_bins[idx] = 1
+                if end_scores[idx] > end_scores[
+                        idx + 1] and end_scores[idx] > end_scores[idx - 1]:
+                    end_bins[idx] = 1
+                elif end_scores[idx] > (0.5 * max_end):
+                    end_bins[idx] = 1
+
+            # iterate through all combinations of start_index and end_index
+            new_proposals = []
+            for idx in range(self.tscale):
+                for jdx in range(self.tscale):
+                    start_index = jdx
+                    end_index = start_index + idx + 1
+                    if end_index < self.tscale and start_bins[
+                            start_index] == 1 and end_bins[end_index] == 1:
+                        tmin = start_index / self.tscale
+                        tmax = end_index / self.tscale
+                        tmin_score = start_scores[start_index]
+                        tmax_score = end_scores[end_index]
+                        cls_score = cls_confidence[idx, jdx]
+                        reg_score = reg_confidence[idx, jdx]
+                        score = tmin_score * tmax_score * cls_score * reg_score
+                        new_proposals.append([
+                            tmin, tmax, tmin_score, tmax_score, cls_score,
+                            reg_score, score
+                        ])
+            new_proposals = np.stack(new_proposals)
+            video_info = dict(video_meta[0])
+            proposal_list_text = post_processing(new_proposals, video_info,
+                                            self.soft_nms_alpha,
+                                            self.soft_nms_low_threshold,
+                                            self.soft_nms_high_threshold,
+                                            self.post_process_top_k,
+                                            self.feature_extraction_interval)
+            proposal_list_text = [ dict(score=proposal['score'], segment=proposal['segment'], class_text=text)
+                for proposal in proposal_list_text]
+            proposal_list += proposal_list_text
         output = [
             dict(
                 video_name=video_info['video_name'],
